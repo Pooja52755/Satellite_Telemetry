@@ -1,0 +1,114 @@
+import os
+from pymongo import MongoClient
+from pymongo.errors import ConnectionFailure
+from typing import List, Dict, Any
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class MongoDBManager:
+    """MongoDB operations manager."""
+    
+    def __init__(self):
+        self.mongodb_uri = os.getenv("MONGODB_URI", "mongodb+srv://pooja:Sujatha123@cluster0.ldsniit.mongodb.net/satellite_telemetry?retryWrites=true&w=majority&appName=Cluster0")
+        self.db_name = "satellite_telemetry"
+        self.client = None
+        self.db = None
+        
+    def connect(self) -> bool:
+        """Connect to MongoDB."""
+        try:
+            self.client = MongoClient(self.mongodb_uri, serverSelectionTimeoutMS=5000)
+            # Test connection
+            self.client.admin.command('ping')
+            self.db = self.client[self.db_name]
+            
+            # Create collections if not exist
+            self._create_collections()
+            logger.info("Connected to MongoDB successfully")
+            return True
+        except ConnectionFailure as e:
+            logger.error(f"Failed to connect to MongoDB: {e}")
+            return False
+    
+    def _create_collections(self):
+        """Create collections with indexes."""
+        if "telemetry" not in self.db.list_collection_names():
+            self.db.create_collection("telemetry")
+            self.db.telemetry.create_index("timestamp")
+            
+        if "anomalies" not in self.db.list_collection_names():
+            self.db.create_collection("anomalies")
+            self.db.anomalies.create_index("timestamp")
+            self.db.anomalies.create_index("is_anomaly")
+    
+    def insert_telemetry(self, data: Dict[str, Any]) -> str:
+        """Insert telemetry record."""
+        try:
+            result = self.db.telemetry.insert_one(data)
+            return str(result.inserted_id)
+        except Exception as e:
+            logger.error(f"Error inserting telemetry: {e}")
+            return None
+    
+    def insert_anomaly(self, data: Dict[str, Any]) -> str:
+        """Insert anomaly record."""
+        try:
+            result = self.db.anomalies.insert_one(data)
+            return str(result.inserted_id)
+        except Exception as e:
+            logger.error(f"Error inserting anomaly: {e}")
+            return None
+    
+    def get_recent_telemetry(self, limit: int = 100) -> List[Dict[str, Any]]:
+        """Get recent telemetry records."""
+        try:
+            records = list(self.db.telemetry.find().sort("timestamp", -1).limit(limit))
+            for record in records:
+                record["_id"] = str(record["_id"])
+            return records
+        except Exception as e:
+            logger.error(f"Error fetching telemetry: {e}")
+            return []
+    
+    def get_recent_anomalies(self, limit: int = 50) -> List[Dict[str, Any]]:
+        """Get recent anomaly records."""
+        try:
+            records = list(
+                self.db.anomalies.find({"is_anomaly": True})
+                .sort("timestamp", -1)
+                .limit(limit)
+            )
+            for record in records:
+                record["_id"] = str(record["_id"])
+            return records
+        except Exception as e:
+            logger.error(f"Error fetching anomalies: {e}")
+            return []
+    
+    def get_telemetry_for_retraining(self, window_size: int = 3000) -> List[Dict[str, Any]]:
+        """Get telemetry data for retraining (sliding window)."""
+        try:
+            records = list(
+                self.db.telemetry.find()
+                .sort("timestamp", -1)
+                .limit(window_size)
+            )
+            # Reverse to get chronological order
+            records.reverse()
+            return records
+        except Exception as e:
+            logger.error(f"Error fetching data for retraining: {e}")
+            return []
+    
+    def close(self):
+        """Close MongoDB connection."""
+        if self.client:
+            self.client.close()
+            logger.info("MongoDB connection closed")
+
+
+# Global instance
+db_manager = MongoDBManager()
