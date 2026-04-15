@@ -1,7 +1,7 @@
 ﻿"""Anomaly detection using Isolation Forest, Local Outlier Factor, LSTM, and Autoencoder."""
 
 import numpy as np
-from typing import Dict, Any, Tuple, List
+from typing import Dict, Any, Tuple
 import logging
 
 logger = logging.getLogger(__name__)
@@ -21,6 +21,14 @@ class AnomalyDetector:
             "wheel_temperature"
         ]
         self.sequence_length = 10  # For LSTM: look at 10 previous timesteps
+        # Conservative safety bounds; values outside these ranges are always anomalous.
+        self.hard_bounds = {
+            "battery_voltage": (8.0, 16.8),
+            "bus_voltage": (3.0, 12.0),
+            "wheel_rpm": (0.0, 5000.0),
+            "current": (0.0, 10.0),
+            "wheel_temperature": (-40.0, 120.0),
+        }
 
     def prepare_features(self, data: Dict[str, Any]) -> np.ndarray:
         """Extract features from telemetry data."""
@@ -43,54 +51,73 @@ class AnomalyDetector:
         """
         try:
             results = {
-                "isolation_forest": {"is_anomaly": False, "confidence": 0.0},
-                "local_outlier_factor": {"is_anomaly": False, "confidence": 0.0},
-                "lstm": {"is_anomaly": False, "confidence": 0.0},
-                "autoencoder": {"is_anomaly": False, "confidence": 0.0},
+                "isolation_forest": {"available": False, "is_anomaly": False, "confidence": 0.0},
+                "local_outlier_factor": {"available": False, "is_anomaly": False, "confidence": 0.0},
+                "lstm": {"available": False, "is_anomaly": False, "confidence": 0.0},
+                "autoencoder": {"available": False, "is_anomaly": False, "confidence": 0.0},
+                "hard_limit": {"available": True, "is_anomaly": False, "confidence": 0.0, "violations": []},
                 "ensemble_anomaly": False,
                 "ensemble_confidence": 0.0,
                 "detection_method": "ensemble (IF + LOF + LSTM + Autoencoder)"
             }
 
+            # Hard-limit detection first for obvious physical outliers.
+            hard_limit_score = self._detect_hard_limits(data)
+            results["hard_limit"] = hard_limit_score
+
             # Isolation Forest detection
             if_score = self._detect_isolation_forest(data)
-            if if_score is not None:
+            if if_score:
                 results["isolation_forest"] = if_score
 
             # Local Outlier Factor detection
             lof_score = self._detect_local_outlier_factor(data)
-            if lof_score is not None:
+            if lof_score:
                 results["local_outlier_factor"] = lof_score
 
             # LSTM detection
             lstm_score = self._detect_lstm(data)
-            if lstm_score is not None:
+            if lstm_score:
                 results["lstm"] = lstm_score
 
             # Autoencoder detection
             ae_score = self._detect_autoencoder(data)
-            if ae_score is not None:
+            if ae_score:
                 results["autoencoder"] = ae_score
 
-            # Ensemble decision: voting mechanism
-            anomaly_votes = sum([
-                results["isolation_forest"]["is_anomaly"],
-                results["local_outlier_factor"]["is_anomaly"],
-                results["lstm"]["is_anomaly"],
-                results["autoencoder"]["is_anomaly"]
-            ])
-            
-            # Flag as anomaly if 2 or more models agree
-            results["ensemble_anomaly"] = anomaly_votes >= 2
-            
-            # Calculate combined confidence (average of all models)
-            confidences = [
-                results["isolation_forest"]["confidence"],
-                results["local_outlier_factor"]["confidence"],
-                results["lstm"]["confidence"],
-                results["autoencoder"]["confidence"]
-            ]
-            results["ensemble_confidence"] = np.mean(confidences)
+            # Annotate model results with whether they are custom/mock/unavailable.
+            source_map = {
+                "isolation_forest": "isolation_forest",
+                "local_outlier_factor": "local_outlier_factor",
+                "lstm": "lstm",
+                "autoencoder": "autoencoder",
+            }
+            for result_key, model_key in source_map.items():
+                source = self.model_manager.get_model_source(model_key)
+                results[result_key]["source"] = source
+                results[result_key]["using_custom_model"] = source == "custom"
+
+            model_keys = ["isolation_forest", "local_outlier_factor", "lstm", "autoencoder"]
+            active_models = [k for k in model_keys if results[k].get("available")]
+            anomaly_votes = sum(1 for k in active_models if results[k]["is_anomaly"])
+
+            # Strict majority across active models; if only one model is active, trust that model.
+            if len(active_models) <= 1:
+                required_votes = 1
+            else:
+                required_votes = (len(active_models) // 2) + 1
+            model_ensemble_anomaly = anomaly_votes >= required_votes
+
+            # Hard limits override model votes for obvious safety violations.
+            results["ensemble_anomaly"] = bool(results["hard_limit"]["is_anomaly"] or model_ensemble_anomaly)
+
+            confidences = [results[k]["confidence"] for k in active_models]
+            if confidences:
+                model_confidence = float(np.mean(confidences))
+            else:
+                model_confidence = 0.0
+
+            results["ensemble_confidence"] = max(model_confidence, results["hard_limit"]["confidence"])
 
             return results["ensemble_anomaly"], results["ensemble_confidence"], results
 
@@ -98,37 +125,64 @@ class AnomalyDetector:
             logger.error(f"Error in anomaly detection: {e}")
             return False, 0.0, {"error": str(e)}
 
+    def _detect_hard_limits(self, data: Dict[str, Any]) -> Dict:
+        """Flag anomalies when values violate conservative physical bounds."""
+        violations = []
+        for feature, (lower, upper) in self.hard_bounds.items():
+            value = data.get(feature)
+            if value is None:
+                continue
+            if value < lower or value > upper:
+                violations.append(
+                    {
+                        "feature": feature,
+                        "value": float(value),
+                        "expected_min": lower,
+                        "expected_max": upper,
+                    }
+                )
+
+        is_anomaly = len(violations) > 0
+        confidence = min(1.0, 0.7 + 0.1 * len(violations)) if is_anomaly else 0.0
+        return {
+            "available": True,
+            "is_anomaly": is_anomaly,
+            "confidence": confidence,
+            "violations": violations,
+        }
+
     def _detect_isolation_forest(self, data: Dict[str, Any]) -> Dict:
         """Detect anomaly using Isolation Forest."""
         try:
             if_model = self.model_manager.get_isolation_forest()
             if if_model is None:
-                return {"is_anomaly": False, "confidence": 0.0}
+                return {"available": False, "is_anomaly": False, "confidence": 0.0}
 
             features = self.prepare_features(data)
 
             # IF returns -1 for anomalies, 1 for normal
             predictions = if_model.predict(features)
-            anomaly_scores = if_model.score_samples(features)
+            decision = if_model.decision_function(features)
 
             is_anomaly = predictions[0] == -1
-            # Normalize score to [0, 1] where 1 is more anomalous
-            confidence = 1 / (1 + np.exp(-anomaly_scores[0]))
+            # Lower decision_function means more anomalous.
+            confidence = 1 / (1 + np.exp(6.0 * decision[0]))
 
             return {
+                "available": True,
                 "is_anomaly": bool(is_anomaly),
-                "confidence": float(confidence)
+                "confidence": float(np.clip(confidence, 0.0, 1.0))
             }
         except Exception as e:
             logger.warning(f"Isolation Forest detection failed: {e}")
-            return {"is_anomaly": False, "confidence": 0.0}
+            return {"available": False, "is_anomaly": False, "confidence": 0.0}
 
     def _detect_lstm(self, data: Dict[str, Any]) -> Dict:
         """Detect anomaly using LSTM model."""
         try:
             lstm_model = self.model_manager.get_lstm_model()
             if lstm_model is None:
-                return {"is_anomaly": False, "confidence": 0.0}
+                return {"available": False, "is_anomaly": False, "confidence": 0.0}
 
             features = self.prepare_features(data)
             
@@ -145,50 +199,47 @@ class AnomalyDetector:
             is_anomaly = confidence > threshold
 
             return {
+                "available": True,
                 "is_anomaly": bool(is_anomaly),
                 "confidence": min(confidence, 1.0)  # Ensure it's between 0 and 1
             }
         except Exception as e:
             logger.warning(f"LSTM detection failed: {e}")
-            return {"is_anomaly": False, "confidence": 0.0}
+            return {"available": False, "is_anomaly": False, "confidence": 0.0}
 
     def _detect_local_outlier_factor(self, data: Dict[str, Any]) -> Dict:
         """Detect anomaly using Local Outlier Factor (LOF)."""
         try:
             lof_model = self.model_manager.get_lof_model()
             if lof_model is None:
-                return {"is_anomaly": False, "confidence": 0.0}
+                return {"available": False, "is_anomaly": False, "confidence": 0.0}
 
             features = self.prepare_features(data)
 
             # LOF returns -1 for outliers, 1 for inliers
             predictions = lof_model.predict(features)
             is_anomaly = predictions[0] == -1
-            
-            # Get LOF scores (negative_outlier_factor)
-            # LOF scores close to 1 are normal, > 1 are outliers
-            lof_scores = lof_model.negative_outlier_factor_
-            if len(lof_scores) > 0:
-                # Normalize to [0, 1] using sigmoid
-                mean_score = np.mean(lof_scores)
-                confidence = 1 / (1 + np.exp(-(1 - mean_score) * 5))  # Scaled sigmoid
-            else:
-                confidence = 0.0
+
+            # score_samples is higher for inliers and lower for outliers.
+            sample_score = float(lof_model.score_samples(features)[0])
+            offset = float(getattr(lof_model, "offset_", -1.5))
+            confidence = 1 / (1 + np.exp(-6.0 * (offset - sample_score)))
 
             return {
+                "available": True,
                 "is_anomaly": bool(is_anomaly),
                 "confidence": float(np.clip(confidence, 0, 1))
             }
         except Exception as e:
             logger.warning(f"Local Outlier Factor detection failed: {e}")
-            return {"is_anomaly": False, "confidence": 0.0}
+            return {"available": False, "is_anomaly": False, "confidence": 0.0}
 
     def _detect_autoencoder(self, data: Dict[str, Any]) -> Dict:
         """Detect anomaly using Autoencoder reconstruction error."""
         try:
             autoencoder_model = self.model_manager.get_autoencoder_model()
             if autoencoder_model is None:
-                return {"is_anomaly": False, "confidence": 0.0}
+                return {"available": False, "is_anomaly": False, "confidence": 0.0}
 
             features = self.prepare_features(data)
             
@@ -205,9 +256,10 @@ class AnomalyDetector:
             is_anomaly = mse > threshold
 
             return {
+                "available": True,
                 "is_anomaly": bool(is_anomaly),
                 "confidence": float(confidence)
             }
         except Exception as e:
             logger.warning(f"Autoencoder detection failed: {e}")
-            return {"is_anomaly": False, "confidence": 0.0}
+            return {"available": False, "is_anomaly": False, "confidence": 0.0}

@@ -338,6 +338,15 @@
                     updateChart();
                 }
             }, [forecast]);
+
+            useEffect(() => {
+                return () => {
+                    if (chartInstance.current) {
+                        chartInstance.current.destroy();
+                        chartInstance.current = null;
+                    }
+                };
+            }, []);
             
             const fetchStats = async () => {
                 try {
@@ -361,11 +370,24 @@
             
             const fetchForecast = async (feature) => {
                 try {
-                    const res = await fetch(`${API_BASE}/api/anomaly-forecast?feature=${feature}&periods=48`);
+                    const res = await fetch(`${API_BASE}/api/forecast?feature=${feature}&periods=48`, {
+                        method: 'POST'
+                    });
+
+                    if (!res.ok) {
+                        throw new Error('Forecast request failed');
+                    }
+
                     const data = await res.json();
-                    setForecast(data);
+
+                    if (!Array.isArray(data.data)) {
+                        throw new Error('Invalid forecast response');
+                    }
+
+                    setForecast({ forecast_data: data.data });
                 } catch (err) {
                     console.error('Error fetching forecast:', err);
+                    setForecast(null);
                     setMessage({ type: 'warning', text: 'Forecast unavailable - train models first' });
                 }
             };
@@ -379,10 +401,13 @@
                     chartInstance.current.destroy();
                 }
                 
-                const labels = forecast.forecast_data.map(d => new Date(d.timestamp).getHours() + ':00');
-                const forecasts = forecast.forecast_data.map(d => d.forecast);
-                const lower = forecast.forecast_data.map(d => d.lower_bound);
-                const upper = forecast.forecast_data.map(d => d.upper_bound);
+                const forecastData = Array.isArray(forecast?.forecast_data) ? forecast.forecast_data : [];
+                if (forecastData.length === 0) return;
+
+                const labels = forecastData.map(d => new Date(d.timestamp).getHours() + ':00');
+                const forecasts = forecastData.map(d => d.forecast);
+                const lower = forecastData.map(d => d.lower_bound);
+                const upper = forecastData.map(d => d.upper_bound);
                 
                 chartInstance.current = new Chart(ctx, {
                     type: 'line',
@@ -586,7 +611,7 @@
                         <div style={{marginBottom: '15px'}}>
                             <label style={{marginRight: '20px', color: '#333', fontWeight: 'bold'}}>Select Feature to Forecast:</label>
                             <div className="feature-buttons">
-                                {['battery_temp', 'bus_current', 'bus_voltage', 'wheel_rpm', 'wheel_temp'].map(feature => (
+                                {['battery_voltage', 'bus_voltage', 'wheel_rpm', 'current', 'wheel_temperature'].map(feature => (
                                     <button
                                         key={feature}
                                         className={`feature-btn ${selectedFeature === feature ? 'active' : ''}`}
@@ -610,7 +635,7 @@
                                             <div className="forecast-item" key={idx}>
                                                 <div style={{fontWeight: 'bold'}}>{new Date(item.timestamp).toLocaleTimeString()}</div>
                                                 <div style={{fontSize: '12px', color: '#666'}}>
-                                                    Forecast: <strong>{item.forecast.toFixed(2)}</strong> {' | Range: ' + item.confidence_interval}
+                                                    Forecast: <strong>{item.forecast.toFixed(2)}</strong> {' | Range: ' + item.lower_bound.toFixed(2) + ' - ' + item.upper_bound.toFixed(2)}
                                                 </div>
                                             </div>
                                         ))}

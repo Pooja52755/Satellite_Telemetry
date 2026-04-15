@@ -160,7 +160,15 @@ async def ingest_telemetry(data: TelemetryData):
             is_anomaly=is_anomaly,
             confidence=confidence,
             anomaly_score=confidence,
-            detection_method="ensemble (Isolation Forest + LOF + LSTM + Autoencoder)"
+            detection_method="ensemble (Isolation Forest + LOF + LSTM + Autoencoder)",
+            model_results={
+                "isolation_forest": detection_details.get("isolation_forest"),
+                "local_outlier_factor": detection_details.get("local_outlier_factor"),
+                "lstm": detection_details.get("lstm"),
+                "autoencoder": detection_details.get("autoencoder"),
+                "hard_limit": detection_details.get("hard_limit"),
+            },
+            model_usage=model_manager.get_model_usage_summary()
         )
     except Exception as e:
         logger.error(f"Error in anomaly detection: {e}")

@@ -5,6 +5,7 @@ from pymongo.errors import ConnectionFailure, ConfigurationError
 from typing import List, Dict, Any
 from datetime import datetime
 import logging
+from bson import ObjectId
 from app.config import settings
 
 logger = logging.getLogger(__name__)
@@ -50,6 +51,16 @@ class MongoDBManager:
             self.db.create_collection("forecasts")
             self.db.forecasts.create_index("timestamp")
 
+    def _serialize_bson(self, value: Any) -> Any:
+        """Recursively convert BSON types (ObjectId, nested docs/lists) to JSON-safe types."""
+        if isinstance(value, ObjectId):
+            return str(value)
+        if isinstance(value, dict):
+            return {k: self._serialize_bson(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [self._serialize_bson(v) for v in value]
+        return value
+
     def insert_telemetry(self, data: Dict[str, Any]) -> str:
         """Insert telemetry record."""
         try:
@@ -84,9 +95,7 @@ class MongoDBManager:
         """Get recent telemetry records."""
         try:
             records = list(self.db.telemetry.find().sort("timestamp", -1).limit(limit))
-            for record in records:
-                record["_id"] = str(record["_id"])
-            return records
+            return [self._serialize_bson(record) for record in records]
         except Exception as e:
             logger.error(f"Error fetching telemetry: {e}")
             return []
@@ -99,9 +108,7 @@ class MongoDBManager:
                 .sort("timestamp", -1)
                 .limit(limit)
             )
-            for record in records:
-                record["_id"] = str(record["_id"])
-            return records
+            return [self._serialize_bson(record) for record in records]
         except Exception as e:
             logger.error(f"Error fetching anomalies: {e}")
             return []
@@ -115,9 +122,7 @@ class MongoDBManager:
                 .limit(limit)
             )
             records.reverse()
-            for record in records:
-                record["_id"] = str(record["_id"])
-            return records
+            return [self._serialize_bson(record) for record in records]
         except Exception as e:
             logger.error(f"Error fetching training data: {e}")
             return []
@@ -131,9 +136,7 @@ class MongoDBManager:
                 .limit(window_size)
             )
             records.reverse()
-            for record in records:
-                record["_id"] = str(record["_id"])
-            return records
+            return [self._serialize_bson(record) for record in records]
         except Exception as e:
             logger.error(f"Error fetching data for retraining: {e}")
             return []

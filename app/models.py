@@ -28,6 +28,18 @@ class ModelManager:
         self.prophet_models: Dict[str, Any] = {}  # Feature-specific Prophet models
         self.models_path = os.path.join(os.path.dirname(__file__), "..", "models")
         self.using_mock_models = False
+        self.model_sources: Dict[str, str] = {
+            "isolation_forest": "unavailable",
+            "local_outlier_factor": "unavailable",
+            "lstm": "unavailable",
+            "autoencoder": "unavailable",
+        }
+        self.model_paths: Dict[str, Optional[str]] = {
+            "isolation_forest": None,
+            "local_outlier_factor": None,
+            "lstm": None,
+            "autoencoder": None,
+        }
 
     def load_models(self) -> bool:
         """Load pre-trained models at startup."""
@@ -48,14 +60,20 @@ class ModelManager:
                 try:
                     with open(if_path, "rb") as f:
                         self.isolation_forest = pickle.load(f)
+                    self.model_sources["isolation_forest"] = "custom"
+                    self.model_paths["isolation_forest"] = if_path
                     logger.info(f"✓ Isolation Forest model loaded from {os.path.basename(if_path)}")
                 except Exception as e:
                     logger.warning(f"Failed to load Isolation Forest: {e}. Using mock model.")
                     self.isolation_forest = self._create_mock_isolation_forest()
+                    self.model_sources["isolation_forest"] = "mock"
+                    self.model_paths["isolation_forest"] = None
                     self.using_mock_models = True
             else:
                 logger.warning("Isolation Forest model not found. Creating mock model.")
                 self.isolation_forest = self._create_mock_isolation_forest()
+                self.model_sources["isolation_forest"] = "mock"
+                self.model_paths["isolation_forest"] = None
                 self.using_mock_models = True
 
             # Load LSTM model
@@ -108,7 +126,7 @@ class ModelManager:
                 [12, 5, 100, 2, 40]
             )
 
-            model = LocalOutlierFactor(n_neighbors=20, contamination=0.05)
+            model = LocalOutlierFactor(n_neighbors=20, contamination=0.05, novelty=True)
             model.fit(X_train)
             logger.info("Created mock Local Outlier Factor model")
             return model
@@ -159,19 +177,27 @@ class ModelManager:
         try:
             if keras is None:
                 logger.warning("TensorFlow/Keras not available. LSTM model cannot be loaded.")
+                self.model_sources["lstm"] = "unavailable"
+                self.model_paths["lstm"] = None
                 return False
 
             lstm_path = os.path.join(self.models_path, "lstm_model.keras")
             
             if not os.path.exists(lstm_path):
                 logger.warning(f"LSTM model not found at {lstm_path}")
+                self.model_sources["lstm"] = "unavailable"
+                self.model_paths["lstm"] = None
                 return False
 
             self.lstm_model = keras.models.load_model(lstm_path)
+            self.model_sources["lstm"] = "custom"
+            self.model_paths["lstm"] = lstm_path
             logger.info(f"✓ LSTM model loaded from {lstm_path}")
             return True
         except Exception as e:
             logger.warning(f"Failed to load LSTM model: {e}")
+            self.model_sources["lstm"] = "unavailable"
+            self.model_paths["lstm"] = None
             return False
 
     def _load_lof_model(self) -> bool:
@@ -182,16 +208,34 @@ class ModelManager:
             if not os.path.exists(lof_path):
                 logger.warning(f"LOF model not found at {lof_path}. Creating mock model.")
                 self.local_outlier_factor = self._create_mock_lof()
+                self.model_sources["local_outlier_factor"] = "mock"
+                self.model_paths["local_outlier_factor"] = None
                 self.using_mock_models = True
                 return True
 
             with open(lof_path, "rb") as f:
                 self.local_outlier_factor = pickle.load(f)
+
+            # predict/score_samples on unseen points require novelty=True.
+            if not getattr(self.local_outlier_factor, "novelty", False):
+                logger.warning(
+                    "Loaded LOF model does not support novelty scoring. Replacing with mock novelty LOF."
+                )
+                self.local_outlier_factor = self._create_mock_lof()
+                self.model_sources["local_outlier_factor"] = "mock"
+                self.model_paths["local_outlier_factor"] = None
+                self.using_mock_models = True
+            else:
+                self.model_sources["local_outlier_factor"] = "custom"
+                self.model_paths["local_outlier_factor"] = lof_path
+
             logger.info(f"✓ LOF model loaded from {lof_path}")
             return True
         except Exception as e:
             logger.warning(f"Failed to load LOF model: {e}. Creating mock model.")
             self.local_outlier_factor = self._create_mock_lof()
+            self.model_sources["local_outlier_factor"] = "mock"
+            self.model_paths["local_outlier_factor"] = None
             self.using_mock_models = True
             return True
 
@@ -200,6 +244,8 @@ class ModelManager:
         try:
             if keras is None:
                 logger.warning("TensorFlow/Keras not available. Autoencoder model cannot be loaded.")
+                self.model_sources["autoencoder"] = "unavailable"
+                self.model_paths["autoencoder"] = None
                 return False
 
             ae_path = os.path.join(self.models_path, "autoencoder_model.keras")
@@ -207,15 +253,25 @@ class ModelManager:
             if not os.path.exists(ae_path):
                 logger.warning(f"Autoencoder model not found at {ae_path}. Creating mock model.")
                 self.autoencoder_model = self._create_mock_autoencoder()
+                self.model_sources["autoencoder"] = (
+                    "mock" if self.autoencoder_model is not None else "unavailable"
+                )
+                self.model_paths["autoencoder"] = None
                 self.using_mock_models = True
                 return True
 
             self.autoencoder_model = keras.models.load_model(ae_path)
+            self.model_sources["autoencoder"] = "custom"
+            self.model_paths["autoencoder"] = ae_path
             logger.info(f"✓ Autoencoder model loaded from {ae_path}")
             return True
         except Exception as e:
             logger.warning(f"Failed to load Autoencoder model: {e}. Creating mock model.")
             self.autoencoder_model = self._create_mock_autoencoder()
+            self.model_sources["autoencoder"] = (
+                "mock" if self.autoencoder_model is not None else "unavailable"
+            )
+            self.model_paths["autoencoder"] = None
             self.using_mock_models = True
             return True
 
@@ -278,6 +334,35 @@ class ModelManager:
     def get_available_prophet_features(self) -> list:
         """Get list of available Prophet model features."""
         return list(self.prophet_models.keys())
+
+    def get_model_source(self, model_name: str) -> str:
+        """Get source for a model: custom | mock | unavailable."""
+        return self.model_sources.get(model_name, "unavailable")
+
+    def get_model_usage_summary(self) -> Dict[str, Dict[str, Any]]:
+        """Return model usage metadata for API/debugging."""
+        return {
+            "isolation_forest": {
+                "source": self.model_sources["isolation_forest"],
+                "using_custom_model": self.model_sources["isolation_forest"] == "custom",
+                "model_path": self.model_paths["isolation_forest"],
+            },
+            "local_outlier_factor": {
+                "source": self.model_sources["local_outlier_factor"],
+                "using_custom_model": self.model_sources["local_outlier_factor"] == "custom",
+                "model_path": self.model_paths["local_outlier_factor"],
+            },
+            "lstm": {
+                "source": self.model_sources["lstm"],
+                "using_custom_model": self.model_sources["lstm"] == "custom",
+                "model_path": self.model_paths["lstm"],
+            },
+            "autoencoder": {
+                "source": self.model_sources["autoencoder"],
+                "using_custom_model": self.model_sources["autoencoder"] == "custom",
+                "model_path": self.model_paths["autoencoder"],
+            },
+        }
 
     def save_isolation_forest(self, path: Optional[str] = None) -> bool:
         """Save Isolation Forest model to disk."""
